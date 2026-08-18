@@ -1,0 +1,26 @@
+name: knob-controller
+summary: Control your keyboard knob your way
+description: |
+  KNOBController turns your keyboard's knob into a powerful desktop control:
+  scroll, volume, cursor, brightness, zoom, app switching, terminal panes or
+  any command you configure. GNU/Linux.
+grade: stable
+confinement: strict
+base: core22
+
+apps:
+  knob-controller:
+    command: knob-controller-native
+    plugs: [home, x11, wayland]
+
+parts:
+  knob-controller:
+    plugin: dump
+    source: ..
+    organize:
+      native-app/knob-controller-native: bin/knob-controller-native
+      backend/knob-controller: bin/knob-controller
+    stage:
+      - bin/*
+    prime:
+      - bin/*

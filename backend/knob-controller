@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""
+KNOBController — el cerebro.
+Controla el knob del teclado MEETION y lo convierte en lo que TÚ quieras:
+scroll, volumen, cursor, brillo, zoom, cambiar apps, paneles de terminal,
+o ejecutar CUALQUIER comando. Todo configurable y capturable desde la UI.
+
+Edge Marketing Agency — Software libre.
+"""
+import fcntl
+import json
+import os
+import queue
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOST = "127.0.0.1"
+PORT = 8766
+CONFIG_PATH = Path("/etc/knob-controller/config.json")
+
+EV_SYN = 0
+EV_KEY = 1
+EV_REL = 2
+SYN_REPORT = 0
+KEY_VOLUMEDOWN = 114
+KEY_VOLUMEUP = 115
+KEY_LEFT = 105
+KEY_RIGHT = 106
+KEY_TAB = 15
+KEY_LEFTALT = 56
+KEY_RIGHTALT = 100
+KEY_LEFTCTRL = 29
+KEY_RIGHTCTRL = 97
+KEY_LEFTSHIFT = 42
+KEY_RIGHTSHIFT = 54
+KEY_ENTER = 28
+KEY_ESC = 1
+KEY_SPACE = 57
+KEY_BRIGHTNESSUP = 225
+KEY_BRIGHTNESSDOWN = 224
+KEY_ZOOMIN = 418
+KEY_ZOOMOUT = 419
+REL_WHEEL = 8
+REL_HWHEEL = 6
+BUS_USB = 0x03
+
+# El botón del knob (empuje) manda KEY_MUTE (113) — confirmado en vivo.
+KEY_KNOB_CLICK = 113
+
+MODES = {"scroll", "volume", "text", "brightness", "zoom"}
+DEFAULT_MODE = "scroll"
+CLICK_TOGGLE_MODES = ("scroll", "text")
+
+# Modificadores espiados desde el teclado normal SIN grabarlo.
+MODIFIER_KEYS = {KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
+MOD_ALT = {KEY_LEFTALT, KEY_RIGHTALT}
+MOD_CTRL = {KEY_LEFTCTRL, KEY_RIGHTCTRL}
+MOD_SHIFT = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
+MOD_MAP = {"alt": MOD_ALT, "ctrl": MOD_CTRL, "shift": MOD_SHIFT}
+
+SHORTCUT_KEYCODES = {
+    "tab": KEY_TAB, "left": KEY_LEFT, "right": KEY_RIGHT,
+    "leftalt": KEY_LEFTALT, "rightalt": KEY_RIGHTALT,
+    "leftctrl": KEY_LEFTCTRL, "rightctrl": KEY_RIGHTCTRL,
+    "leftshift": KEY_LEFTSHIFT, "rightshift": KEY_RIGHTSHIFT,
+    "enter": KEY_ENTER, "esc": KEY_ESC, "space": KEY_SPACE,
+}
+
+# Acciones de tipo "command" se ejecutan con el shell; así puedes mapear el
+# knob a CUALQUIER cosa (abrir una app, script, etc).
+KEY_EMIT_KEYS = set(SHORTCUT_KEYCODES.values()) | {KEY_VOLUMEUP, KEY_VOLUMEDOWN}
+
+DEFAULT_SHORTCUTS = [
+    {
+        "id": "alt-apps",
+        "name": "Cambiar de aplicación",
+        "mods": ["alt"],
+        "type": "key",
+        "up": ["tab"], "down": ["tab"],
+        "wrap": True, "enabled": True,
+    },
+    {
+        "id": "ctrl-panes",
+        "name": "Paneles de terminal",
+        "mods": ["ctrl"],
+        "type": "key",
+        "up": ["right"], "down": ["left"],
+        "wrap": False, "enabled": True,
+    },
+]
+
+IOC_NRBITS = 8
+IOC_TYPEBITS = 8
+IOC_SIZEBITS = 14
+IOC_NRSHIFT = 0
+IOC_TYPESHIFT = IOC_NRSHIFT + IOC_NRBITS
+IOC_SIZESHIFT = IOC_TYPESHIFT + IOC_TYPEBITS
+IOC_DIRSHIFT = IOC_SIZESHIFT + IOC_SIZEBITS
+IOC_NONE = 0
+IOC_WRITE = 1
+
+
+def ioc(direction, type_, nr, size):
+    return (
+        (direction << IOC_DIRSHIFT)
+        | (ord(type_) << IOC_TYPESHIFT)
+        | (nr << IOC_NRSHIFT)
+        | (size << IOC_SIZESHIFT)
+    )
+
+
+UI_DEV_CREATE = ioc(IOC_NONE, "U", 1, 0)
+UI_DEV_DESTROY = ioc(IOC_NONE, "U", 2, 0)
+UI_SET_EVBIT = ioc(IOC_WRITE, "U", 100, struct.calcsize("i"))
+UI_SET_KEYBIT = ioc(IOC_WRITE, "U", 101, struct.calcsize("i"))
+UI_SET_RELBIT = ioc(IOC_WRITE, "U", 102, struct.calcsize("i"))
+EVIOCGRAB = ioc(IOC_WRITE, "E", 0x90, struct.calcsize("i"))
+
+EVENT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT)
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.mode = DEFAULT_MODE
+        self.scroll_step = 1
+        self.scroll_invert = False
+        self.device = "not found"
+        self.shortcuts = DEFAULT_SHORTCUTS
+        self.held_mods = set()
+        self.capture_mode = False  # cuando True, el próximo giro "captura" el
+        self.clients = []
+        self.running = True
+
+    def load(self):
+        if CONFIG_PATH.exists():
+            try:
+                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                self.mode = data.get("mode", DEFAULT_MODE) if data.get("mode") in MODES else DEFAULT_MODE
+                step = data.get("scroll_step", 1)
+                self.scroll_step = step if isinstance(step, int) and 1 <= step <= 10 else 1
+                self.scroll_invert = bool(data.get("scroll_invert", False))
+                self.shortcuts = self._validate_shortcuts(data.get("shortcuts"))
+            except Exception:
+                self.mode = DEFAULT_MODE
+                self.scroll_step = 1
+                self.scroll_invert = False
+                self.shortcuts = DEFAULT_SHORTCUTS
+        else:
+            self.save()
+
+    @staticmethod
+    def _validate_shortcuts(shortcuts):
+        if not isinstance(shortcuts, list) or not shortcuts:
+            return DEFAULT_SHORTCUTS
+        valid = []
+        for sc in shortcuts:
+            if not isinstance(sc, dict):
+                continue
+            mods = [m for m in sc.get("mods", []) if m in MOD_MAP]
+            if not mods:
+                continue
+            stype = sc.get("type", "key")
+            if stype == "command":
+                if not sc.get("command"):
+                    continue
+                valid.append({
+                    "id": str(sc.get("id", "sc-%d" % len(valid))),
+                    "name": str(sc.get("name", "Shortcut")),
+                    "mods": mods,
+                    "type": "command",
+                    "command": str(sc.get("command")),
+                    "up": [], "down": [],
+                    "wrap": True, "enabled": bool(sc.get("enabled", True)),
+                })
+                continue
+            up = [k for k in sc.get("up", []) if k in SHORTCUT_KEYCODES]
+            down = [k for k in sc.get("down", []) if k in SHORTCUT_KEYCODES]
+            if not up and not down:
+                continue
+            valid.append({
+                "id": str(sc.get("id", "sc-%d" % len(valid))),
+                "name": str(sc.get("name", "Shortcut")),
+                "mods": mods,
+                "type": "key",
+                "up": up or down, "down": down or up,
+                "wrap": bool(sc.get("wrap", True)),
+                "enabled": bool(sc.get("enabled", True)),
+            })
+        return valid or DEFAULT_SHORTCUTS
+
+    def save(self):
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "mode": self.mode,
+                    "scroll_step": self.scroll_step,
+                    "scroll_invert": self.scroll_invert,
+                    "shortcuts": self.shortcuts,
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, CONFIG_PATH)
+
+    def set_shortcuts(self, shortcuts):
+        new = self._validate_shortcuts(shortcuts)
+        with self.lock:
+            self.shortcuts = new
+            self.save()
+        self.publish({"type": "shortcuts", "shortcuts": new})
+        return new
+
+    def set_shortcut_enabled(self, sc_id, enabled):
+        new = []
+        with self.lock:
+            for sc in self.shortcuts:
+                item = dict(sc)
+                if item["id"] == sc_id:
+                    item["enabled"] = bool(enabled)
+                new.append(item)
+            self.shortcuts = self._validate_shortcuts(new)
+            self.save()
+        self.publish({"type": "shortcuts", "shortcuts": self.shortcuts})
+        return self.shortcuts
+
+    def add_shortcut(self, sc):
+        sc["id"] = "sc-%d" % int(time.time())
+        new = self._validate_shortcuts(self.shortcuts + [sc])
+        with self.lock:
+            self.shortcuts = new
+            self.save()
+        self.publish({"type": "shortcuts", "shortcuts": new})
+        return new
+
+    def delete_shortcut(self, sc_id):
+        new = [sc for sc in self.shortcuts if sc.get("id") != sc_id]
+        with self.lock:
+            self.shortcuts = self._validate_shortcuts(new) if new else DEFAULT_SHORTCUTS
+            self.save()
+        self.publish({"type": "shortcuts", "shortcuts": self.shortcuts})
+        return self.shortcuts
+
+    def set_capture(self, enabled):
+        with self.lock:
+            self.capture_mode = bool(enabled)
+        self.publish({"type": "capture", "capture": bool(enabled)})
+
+    def active_shortcut(self):
+        held = self.held_mods
+        for sc in self.shortcuts:
+            if not sc.get("enabled", True):
+                continue
+            required = set()
+            for m in sc["mods"]:
+                required |= MOD_MAP[m]
+            if required and required <= held:
+                return sc
+        return None
+
+    def set_mode(self, mode):
+        if mode not in MODES:
+            raise ValueError("invalid mode")
+        with self.lock:
+            self.mode = mode
+            self.save()
+        self.publish({"type": "mode", "mode": mode})
+
+    def toggle_click_mode(self):
+        with self.lock:
+            current = self.mode
+            new_mode = CLICK_TOGGLE_MODES[0] if current == CLICK_TOGGLE_MODES[1] else CLICK_TOGGLE_MODES[1]
+            self.mode = new_mode
+            self.save()
+        self.publish({"type": "mode", "mode": new_mode})
+        return new_mode
+
+    def set_scroll_step(self, scroll_step):
+        if not isinstance(scroll_step, int) or not (1 <= scroll_step <= 10):
+            raise ValueError("invalid scroll_step")
+        with self.lock:
+            self.scroll_step = scroll_step
+            self.save()
+        self.publish({"type": "scroll_step", "scroll_step": scroll_step})
+
+    def set_scroll_invert(self, scroll_invert):
+        with self.lock:
+            self.scroll_invert = bool(scroll_invert)
+            self.save()
+        self.publish({"type": "scroll_invert", "scroll_invert": self.scroll_invert})
+
+    def publish(self, item):
+        dead = []
+        for client in list(self.clients):
+            try:
+                client.put_nowait(item)
+            except Exception:
+                dead.append(client)
+        for client in dead:
+            if client in self.clients:
+                self.clients.remove(client)
+
+
+state = State()
+
+
+def resolve_source():
+    data = Path("/proc/bus/input/devices").read_text(encoding="utf-8")
+    for block in data.strip().split("\n\n"):
+        if 'Name="Evision MEETION Keyboard"' not in block:
+            continue
+        if "REL=1040" not in block:
+            continue
+        for line in block.splitlines():
+            if line.startswith("H: Handlers="):
+                for token in line.split():
+                    if token.startswith("event"):
+                        return "/dev/input/" + token
+    raise RuntimeError("MEETION knob event device not found")
+
+
+def resolve_keyboard():
+    data = Path("/proc/bus/input/devices").read_text(encoding="utf-8")
+    for block in data.strip().split("\n\n"):
+        if 'Name="Evision MEETION Keyboard"' not in block:
+            continue
+        if "REL=1040" in block:
+            continue
+        if "kbd" not in block:
+            continue
+        for line in block.splitlines():
+            if line.startswith("H: Handlers="):
+                for token in line.split():
+                    if token.startswith("event"):
+                        return "/dev/input/" + token
+    raise RuntimeError("MEETION keyboard event device not found")
+
+
+def write_event(fd, ev_type, code, value):
+    sec = int(time.time())
+    usec = int((time.time() - sec) * 1_000_000)
+    os.write(fd, struct.pack(EVENT, sec, usec, ev_type, code, value))
+
+
+def create_uinput():
+    mouse = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    fcntl.ioctl(mouse, UI_SET_EVBIT, EV_REL)
+    fcntl.ioctl(mouse, UI_SET_RELBIT, REL_WHEEL)
+    fcntl.ioctl(mouse, UI_SET_RELBIT, REL_HWHEEL)
+    mouse_dev = struct.pack("80sHHHHi" + "i" * 64 * 4, b"KNOBController scroll", BUS_USB, 0x320F, 0x5055, 1, 0, *([0] * 64 * 4))
+    os.write(mouse, mouse_dev)
+    fcntl.ioctl(mouse, UI_DEV_CREATE)
+
+    keyboard = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    fcntl.ioctl(keyboard, UI_SET_EVBIT, EV_KEY)
+    for key in KEY_EMIT_KEYS:
+        fcntl.ioctl(keyboard, UI_SET_KEYBIT, key)
+    keyboard_dev = struct.pack("80sHHHHi" + "i" * 64 * 4, b"KNOBController keys", BUS_USB, 0x320F, 0x5055, 1, 0, *([0] * 64 * 4))
+    os.write(keyboard, keyboard_dev)
+    fcntl.ioctl(keyboard, UI_DEV_CREATE)
+    return mouse, keyboard
+
+
+def emit_key(fd, key):
+    write_event(fd, EV_KEY, key, 1)
+    write_event(fd, EV_SYN, SYN_REPORT, 0)
+    write_event(fd, EV_KEY, key, 0)
+    write_event(fd, EV_SYN, SYN_REPORT, 0)
+
+
+def emit_chord(fd, keys):
+    for key in keys:
+        write_event(fd, EV_KEY, key, 1)
+    write_event(fd, EV_SYN, SYN_REPORT, 0)
+    for key in keys:
+        write_event(fd, EV_KEY, key, 0)
+    write_event(fd, EV_SYN, SYN_REPORT, 0)
+
+
+def run_command(cmd):
+    try:
+        subprocess.Popen(
+            shlex.split(cmd),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def knob_loop():
+    source = None
+    kbd = None
+    mouse = None
+    keyboard = None
+    while state.running:
+        try:
+            source_path = resolve_source()
+            kbd_path = resolve_keyboard()
+            state.device = source_path
+            source = os.open(source_path, os.O_RDONLY | os.O_NONBLOCK)
+            kbd = os.open(kbd_path, os.O_RDONLY | os.O_NONBLOCK)
+            mouse, keyboard = create_uinput()
+            fcntl.ioctl(source, EVIOCGRAB, 1)
+            print(f"KNOBController active: {source_path} (kbd {kbd_path})", flush=True)
+            while state.running:
+                ready, _, _ = select.select([source, kbd], [], [], 0.5)
+                if not ready:
+                    continue
+                for fd in ready:
+                    if fd is kbd:
+                        kdata = os.read(kbd, EVENT_SIZE * 64)
+                        for idx in range(0, len(kdata) // EVENT_SIZE * EVENT_SIZE, EVENT_SIZE):
+                            _sec, _usec, ev_type, code, value = struct.unpack(EVENT, kdata[idx : idx + EVENT_SIZE])
+                            if ev_type != EV_KEY or code not in MODIFIER_KEYS:
+                                continue
+                            with state.lock:
+                                if value:
+                                    state.held_mods.add(code)
+                                else:
+                                    state.held_mods.discard(code)
+                        continue
+                    data = os.read(source, EVENT_SIZE * 64)
+                    for idx in range(0, len(data) // EVENT_SIZE * EVENT_SIZE, EVENT_SIZE):
+                        _sec, _usec, ev_type, code, value = struct.unpack(EVENT, data[idx : idx + EVENT_SIZE])
+                        if ev_type != EV_KEY or value != 1:
+                            continue
+                        if code == KEY_KNOB_CLICK:
+                            if state.capture_mode:
+                                state.set_capture(False)
+                                state.publish({"type": "captured", "key": "click"})
+                            else:
+                                new_mode = state.toggle_click_mode()
+                                state.publish({"type": "click", "mode": new_mode})
+                            continue
+                        if code == KEY_VOLUMEUP:
+                            delta = 1
+                        elif code == KEY_VOLUMEDOWN:
+                            delta = -1
+                        else:
+                            continue
+
+                        # MODO CAPTURA: en lugar de ejecutar, registramos el
+                        # gesto para que la UI lo guarde como shortcut nuevo.
+                        if state.capture_mode:
+                            state.set_capture(False)
+                            state.publish({"type": "captured", "key": "turn", "direction": "up" if delta > 0 else "down"})
+                            continue
+
+                        with state.lock:
+                            mode = state.mode
+                            scroll_step = state.scroll_step
+                            scroll_invert = state.scroll_invert
+                            shortcut = state.active_shortcut()
+
+                        if shortcut is not None:
+                            keys = shortcut["up"] if delta > 0 else shortcut["down"]
+                            if shortcut.get("type") == "command":
+                                run_command(shortcut["command"])
+                            else:
+                                emit_chord(keyboard, [SHORTCUT_KEYCODES[k] for k in keys])
+                            state.publish({"type": "turn", "delta": delta, "mode": mode, "shortcut": shortcut["id"]})
+                            continue
+
+                        if mode == "scroll":
+                            wheel_delta = -delta if scroll_invert else delta
+                            write_event(mouse, EV_REL, REL_WHEEL, wheel_delta * scroll_step)
+                            write_event(mouse, EV_SYN, SYN_REPORT, 0)
+                        elif mode == "text":
+                            text_delta = -delta if scroll_invert else delta
+                            emit_key(keyboard, KEY_RIGHT if text_delta > 0 else KEY_LEFT)
+                        elif mode == "brightness":
+                            emit_key(keyboard, KEY_BRIGHTNESSDOWN if delta < 0 else KEY_BRIGHTNESSUP)
+                        elif mode == "zoom":
+                            emit_key(keyboard, KEY_ZOOMIN if delta > 0 else KEY_ZOOMOUT)
+                        else:
+                            emit_key(keyboard, KEY_VOLUMEUP if delta > 0 else KEY_VOLUMEDOWN)
+                        state.publish({"type": "turn", "delta": delta, "mode": mode})
+        except Exception as exc:
+            print(f"KNOBController loop error: {exc}", flush=True)
+            time.sleep(2)
+        finally:
+            for fd, destroy in [(source, False), (kbd, False), (mouse, True), (keyboard, True)]:
+                if fd is None:
+                    continue
+                try:
+                    if not destroy:
+                        fcntl.ioctl(fd, EVIOCGRAB, 0)
+                    else:
+                        fcntl.ioctl(fd, UI_DEV_DESTROY)
+                except Exception:
+                    pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            source = kbd = mouse = keyboard = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        return
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/":
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/status":
+            self.send_json({
+                "mode": state.mode,
+                "device": state.device,
+                "scroll_step": state.scroll_step,
+                "scroll_invert": state.scroll_invert,
+                "shortcuts": state.shortcuts,
+                "active_shortcut": state.active_shortcut()["id"] if state.active_shortcut() else None,
+                "capture": state.capture_mode,
+                "modes": list(MODES),
+            })
+        elif self.path == "/events":
+            client = queue.Queue(maxsize=128)
+            state.clients.append(client)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "keep-alive")
+            self.end_headers()
+            try:
+                self.wfile.write(f"data: {json.dumps({'type':'mode','mode':state.mode})}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                while state.running:
+                    try:
+                        item = client.get(timeout=15)
+                    except queue.Empty:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                        continue
+                    self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            except Exception:
+                if client in state.clients:
+                    state.clients.remove(client)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        data = json.loads(self.rfile.read(length) or b"{}")
+        if self.path == "/api/mode":
+            try:
+                state.set_mode(data.get("mode"))
+                self.send_json({"mode": state.mode})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/scroll-step":
+            try:
+                state.set_scroll_step(int(data.get("scroll_step")))
+                self.send_json({"scroll_step": state.scroll_step})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/scroll-invert":
+            state.set_scroll_invert(bool(data.get("scroll_invert")))
+            self.send_json({"scroll_invert": state.scroll_invert})
+        elif self.path == "/api/shortcuts":
+            try:
+                new = state.set_shortcuts(data.get("shortcuts"))
+                self.send_json({"shortcuts": new})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/shortcut-enabled":
+            try:
+                new = state.set_shortcut_enabled(data.get("id"), data.get("enabled"))
+                self.send_json({"shortcuts": new})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/shortcut-add":
+            try:
+                new = state.add_shortcut(data.get("shortcut") or {})
+                self.send_json({"shortcuts": new})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/shortcut-delete":
+            try:
+                new = state.delete_shortcut(data.get("id"))
+                self.send_json({"shortcuts": new})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/capture":
+            state.set_capture(bool(data.get("capture")))
+            self.send_json({"capture": state.capture_mode})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def stop(_signum, _frame):
+    state.running = False
+
+
+HTML = r"""
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>KNOBController</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#101018,#05060a 62%);color:#eef3ff}
+.wrap{max-width:980px;margin:0 auto;padding:34px 20px}
+.top{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+.logo{font-size:15px;font-weight:800;letter-spacing:.22em;color:#a78bfa}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.card{background:rgba(12,16,29,.72);border:1px solid rgba(145,170,255,.22);border-radius:22px;padding:22px}
+h1{margin:0;font-size:clamp(30px,5vw,46px);letter-spacing:-.05em}
+h2{font-size:12px;letter-spacing:.14em;color:#8996bd;text-transform:uppercase;margin:0 0 12px}
+p{color:#aab5d6;line-height:1.5;margin:.4em 0}
+button{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#dfe8ff;padding:9px 14px;border-radius:12px;cursor:pointer;font-weight:700}
+button.active{background:linear-gradient(135deg,#38bdf8,#8b5cf6);color:#fff;border-color:transparent}
+.mode{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.row{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:12px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.07);margin-bottom:8px;font-size:13px}
+.row.active{border-color:#4ade80;background:rgba(34,197,94,.07)}
+.kbd{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:1px 6px;font-size:11px}
+.keys{margin-left:auto;display:flex;gap:5px}
+.tag{color:#4ade80;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+.del{background:rgba(248,113,113,.15);border-color:rgba(248,113,113,.3);color:#fca5a5;padding:3px 8px;font-size:11px}
+input[type=text]{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:#eef3ff;padding:8px 10px;border-radius:10px;font-size:13px;width:100%;box-sizing:border-box}
+label{display:block;font-size:10px;color:#8996bd;letter-spacing:.1em;text-transform:uppercase;margin:8px 0 4px}
+.capture{border:1px dashed #8b5cf6;background:rgba(139,92,246,.08)}
+.capture.hot{border-color:#fbbf24;animation:pulse 1s infinite}
+@keyframes pulse{50%{box-shadow:0 0 20px rgba(251,191,36,.4)}}
+.bar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.bar div{background:rgba(255,255,255,.05);padding:10px;border-radius:12px}
+.bar span{display:block;font-size:10px;color:#8996bd;text-transform:uppercase;letter-spacing:.1em}
+.bar b{font-size:18px}
+.knobwrap{display:grid;place-items:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><span class="logo">KNOBController</span></div>
+  <h1>Tu knob, tus reglas.</h1>
+  <p>Gira el knob del teclado MEETION para controlar apps, paneles de terminal, volumen, brillo o ejecutar cualquier comando. Mantén un modificador y gira para disparar un shortcut.</p>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Qué hace el giro</h2>
+        <div class="mode" id="modes"></div>
+      </div>
+      <div class="card" style="margin-top:18px">
+        <h2>Shortcuts — modificador + rueda</h2>
+        <div id="shortcuts"></div>
+        <div style="margin-top:10px">
+          <label>Nombre del nuevo shortcut</label>
+          <input type="text" id="new-name" placeholder="ej: Abrir terminal"/>
+        </div>
+        <div style="margin-top:6px;display:flex;gap:8px">
+          <button onclick="startCapture('key')">Capturar teclas</button>
+          <button onclick="startCapture('command')">Ejecutar comando</button>
+        </div>
+        <div id="cmdbox" style="display:none;margin-top:8px">
+          <label>Comando a ejecutar al girar</label>
+          <input type="text" id="new-cmd" placeholder="ej: xdg-open https://github.com"/>
+          <button onclick="addCommandShortcut()" style="margin-top:8px;width:100%">Guardar shortcut de comando</button>
+        </div>
+        <p id="capturehint" class="capture" style="display:none;padding:12px;border-radius:12px">
+          <b>Capturando.</b> Mantén el modificador (Alt/Ctrl/Shift) y gira el knob. Se grabará como shortcut nuevo.
+        </p>
+      </div>
+    </div>
+
+    <div>
+      <div class="card knobwrap">
+        <div style="text-align:center" id="status">Conectando...</div>
+      </div>
+      <div class="card" style="margin-top:18px">
+        <h2>Estado</h2>
+        <div class="bar">
+          <div><span>Modo</span><b id="mode">-</b></div>
+          <div><span>Dirección</span><b id="dir">quieto</b></div>
+          <div><span>Ticks</span><b id="ticks">0</b></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const KEY_LABELS={alt:'Alt',ctrl:'Ctrl',shift:'Shift',tab:'Tab',left:'←',right:'→',enter:'Enter',esc:'Esc',space:'Espacio',leftalt:'Alt',rightalt:'Alt',leftctrl:'Ctrl',rightctrl:'Ctrl',leftshift:'Shift',rightshift:'Shift'};
+let capture=null;
+let activeSc=null;
+function el(id){return document.getElementById(id);}
+function renderModes(modes){
+  const modesArr = modes||['scroll','volume','text'];
+  el('modes').innerHTML = modesArr.map(m=>`<button id="m-${m}" onclick="setMode('${m}')">${m}</button>`).join('');
+}
+function applyMode(mode){ el('mode').textContent=mode; document.querySelectorAll('#modes button').forEach(b=>b.classList.toggle('active', b.id==='m-'+mode)); }
+function renderShortcuts(scs, activeId){
+  activeSc=activeId||null;
+  const box=el('shortcuts');
+  if(!scs||!scs.length){box.innerHTML='<p>Sin shortcuts todavía. Crea uno abajo.</p>';return;}
+  box.innerHTML=scs.map(sc=>{
+    const mod=(sc.mods||[]).map(m=>`<span class="kbd">${KEY_LABELS[m]||m}</span>`).join(' + ');
+    const on=sc.enabled!==false;
+    const keys = sc.type==='command' ? `<span class="kbd">⚙ ${sc.command||''}</span>` : (sc.up||[]).map(k=>`<span class="kbd">${KEY_LABELS[k]||k}</span>`).join('');
+    const act = activeId===sc.id ? '<span class="tag">activo</span>' : '';
+    return `<div class="row ${activeId===sc.id?'active':''}">
+      <input type="checkbox" ${on?'checked':''} onchange="toggleSc('${sc.id}',this.checked)"/>
+      <span>${mod} + rueda</span>${act}
+      <span class="keys">${keys}</span>
+      <button class="del" onclick="deleteSc('${sc.id}')">×</button>
+    </div>`;
+  }).join('');
+}
+async function setMode(m){const r=await fetch('/api/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})});const d=await r.json();applyMode(d.mode);}
+async function toggleSc(id,on){await fetch('/api/shortcut-enabled',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id,enabled:on})});refresh();}
+async function deleteSc(id){await fetch('/api/shortcut-delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})});refresh();}
+async function refresh(){
+  const d=await (await fetch('/api/status')).json();
+  renderModes(d.modes); applyMode(d.mode);
+  renderShortcuts(d.shortcuts,d.active_shortcut);
+  el('status').textContent=(d.device||'')+' activo';
+}
+async function startCapture(type){
+  capture={type,mods:null,dir:null};
+  el('capturehint').style.display='block';
+  el('cmdbox').style.display = type==='command' ? 'block' : 'none';
+  await fetch('/api/capture',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({capture:true})});
+}
+async function addCommandShortcut(){
+  const name=el('new-name').value.trim()||'Comando';
+  const command=el('new-cmd').value.trim();
+  if(!command){alert('Escribe un comando');return;}
+  await fetch('/api/shortcut-add',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({shortcut:{name,mods:['alt'],type:'command',command}}) });
+  el('cmdbox').style.display='none'; el('capturehint').style.display='none';
+  await fetch('/api/capture',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({capture:false})});
+  refresh();
+}
+function move(delta){const t=el('ticks');t.textContent=parseInt(t.textContent||'0')+delta;el('dir').textContent=delta>0?'derecha':'izquierda';}
+refresh().catch(()=>{el('status').textContent='Servicio no disponible'});
+const ev=new EventSource('/events');
+ev.onmessage=(m)=>{
+  const d=JSON.parse(m.data);
+  if(d.type==='mode')applyMode(d.mode);
+  if(d.type==='turn'){move(d.delta);if(d.shortcut)refresh();}
+  if(d.type==='captured'){
+    el('capturehint').style.display='none';
+    if(capture&&capture.type==='key'&&d.key==='turn'){
+      // giró sin modificador — no sirve; pedimos que mantenga un modificador
+    }
+    refresh();
+  }
+};
+ev.onerror=()=>{el('status').textContent='Reconectando...'};
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    state.load()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    threading.Thread(target=knob_loop, daemon=True).start()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.timeout = 1.0
+    print(f"KNOBController UI: http://{HOST}:{PORT}", flush=True)
+    while state.running:
+        server.handle_request()
+
+
+if __name__ == "__main__":
+    main()

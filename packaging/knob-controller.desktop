@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=KNOBController
+Name[es]=KNOBController
+Comment=Control your keyboard knob your way
+Comment[es]=Controla tu knob de teclado a tu manera
+Exec=/usr/local/bin/knob-controller-native
+Icon=knob-controller
+Terminal=false
+Categories=Utility;System;
+Keywords=knob;scroll;volume;shortcut;keyboard;
+StartupNotify=false

@@ -1,0 +1,20 @@
+id: art.edgemarketing.KNOBController
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: knob-controller-native
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=all
+modules:
+  - name: knob-controller
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 backend/knob-controller /app/bin/knob-controller
+      - install -Dm755 native-app/knob-controller-native /app/bin/knob-controller-native
+      - install -Dm644 packaging/knob-controller.desktop /app/share/applications/knob-controller.desktop
+    sources:
+      - type: dir
+        path: ..

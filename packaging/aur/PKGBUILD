@@ -1,0 +1,18 @@
+# Maintainer: Edge Marketing Agency <software@edgemarketing.art>
+pkgname=knob-controller
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Control your keyboard knob your way: scroll, volume, cursor, brightness, zoom or any command"
+arch=('any')
+url="https://github.com/mrallanodreman/KNOBController"
+license=('MIT')
+depends=('python' 'gtk3' 'python-cairo' 'libx11')
+source=("$pkgname-$pkgver.tar.gz")
+md5sums=('SKIP')
+
+package() {
+  install -Dm755 "$srcdir/backend/knob-controller" "$pkgdir/usr/local/bin/knob-controller"
+  install -Dm755 "$srcdir/native-app/knob-controller-native" "$pkgdir/usr/local/bin/knob-controller-native"
+  install -Dm644 "$srcdir/packaging/knob-controller.desktop" "$pkgdir/usr/share/applications/knob-controller.desktop"
+  install -Dm644 "$srcdir/packaging/knob-controller.service" "$pkgdir/usr/lib/systemd/system/knob-controller.service"
+}
