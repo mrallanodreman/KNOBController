@@ -7,8 +7,8 @@ arch=('any')
 url="https://github.com/mrallanodreman/KNOBController"
 license=('MIT')
 depends=('python' 'gtk3' 'python-cairo' 'libx11')
-source=("$pkgname-$pkgver.tar.gz")
-md5sums=('SKIP')
+source=("https://github.com/mrallanodreman/KNOBController/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('a56751e1b1914378dc975c171c0fe146791cf023994513cfb6f7009fce3eea66')
 
 package() {
   install -Dm755 "$srcdir/backend/knob-controller" "$pkgdir/usr/local/bin/knob-controller"

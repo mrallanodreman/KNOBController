@@ -27,6 +27,12 @@ EMA_LOGO = os.path.join(ASSET_DIR, "ema-logo-white.png")
 
 CALIBRATION_PATH = os.path.expanduser("~/.config/knob-controller/calibration.json")
 
+MODE_LABELS = {"scroll": "Scroll", "volume": "Volumen", "text": "Cursor", "brightness": "Brillo", "zoom": "Zoom"}
+KEY_LABELS = {
+    "alt": "Alt", "ctrl": "Ctrl", "shift": "Shift",
+    "tab": "Tab", "left": "←", "right": "→", "enter": "Enter", "esc": "Esc", "space": "Espacio",
+}
+
 
 def load_calibration():
     try:
@@ -54,16 +60,6 @@ def load_pixbuf(path, width):
         return pix.scale_simple(width, round(width * ratio), GdkPixbuf.InterpType.BILINEAR)
     except Exception:
         return None
-
-CLICK_LABELS = {
-    "mute": "Silencio",
-    "enter": "Enter",
-    "esc": "Esc",
-    "tab": "Tab",
-    "space": "Espacio",
-    "playpause": "Reproducir / Pausa",
-}
-
 
 class Knob(Gtk.DrawingArea):
     """Perilla dibujada a mano: arco de progreso, aguja con glow, y un
@@ -246,16 +242,15 @@ class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="art.edgemarketing.KNOBController")
         self.mode = "scroll"
-        self.click_key = "mute"
-        self.click_keys = list(CLICK_LABELS.keys())
         self.ticks = 0
         self.last_click_label = "—"
-        self.click_buttons = {}
         self.scroll_step = 1
         self.scroll_invert = False
         self.shortcuts = []
         self.active_shortcut_id = None
         self.shortcut_rows = {}
+        self.click_modes = ["scroll", "text"]
+        self.presets = {}
         self.deg_per_tick, self.angle_offset = load_calibration()
 
     def do_activate(self):
@@ -375,21 +370,24 @@ class App(Gtk.Application):
         step_row.pack_start(self.invert_btn, False, False, 10)
         left.pack_start(step_row, False, False, 0)
 
-        left.pack_start(self._section_label("CLIC DEL KNOB MANDA"), False, False, 0)
-        click_row = Gtk.FlowBox()
-        click_row.set_selection_mode(Gtk.SelectionMode.NONE)
-        click_row.set_max_children_per_line(6)
-        click_row.set_row_spacing(8)
-        click_row.set_column_spacing(8)
-        for key in self.click_keys:
-            btn = self._pill(CLICK_LABELS.get(key, key), self._click_handler(key), small=True)
-            self.click_buttons[key] = btn
-            click_row.insert(btn, -1)
-        left.pack_start(click_row, False, False, 0)
+        left.pack_start(self._section_label("CLIC DEL KNOB — ALTERNA ENTRE"), False, False, 0)
+        click_mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.click_mode_combo_a = self._mode_combo()
+        self.click_mode_combo_a.connect("changed", lambda c: self.on_click_mode_changed(c, self.click_mode_combo_b))
+        arrow = Gtk.Label(label="↔")
+        arrow.get_style_context().add_class("copy")
+        self.click_mode_combo_b = self._mode_combo()
+        self.click_mode_combo_b.connect("changed", lambda c: self.on_click_mode_changed(c, self.click_mode_combo_a))
+        click_mode_row.pack_start(self.click_mode_combo_a, False, False, 0)
+        click_mode_row.pack_start(arrow, False, False, 0)
+        click_mode_row.pack_start(self.click_mode_combo_b, False, False, 0)
+        left.pack_start(click_mode_row, False, False, 0)
 
         left.pack_start(self._section_label("SHORTCUTS — MODIFICADOR + RUEDA"), False, False, 0)
         self.shortcut_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         left.pack_start(self.shortcut_box, False, False, 0)
+        capture_btn = self._pill("+ Capturar combinación", lambda _b: self.start_capture(), small=True)
+        left.pack_start(capture_btn, False, False, 4)
 
         left.pack_start(Gtk.Separator(), False, False, 6)
 
@@ -398,7 +396,7 @@ class App(Gtk.Application):
         self.mode_value = self._stat(stats, 0, "MODO", "...")
         self.dir_value = self._stat(stats, 1, "GIRO", "quieto")
         self.ticks_value = self._stat(stats, 2, "TICKS", "0")
-        self.click_value = self._stat(stats, 3, "ÚLTIMO CLIC", "—")
+        self.click_value = self._stat(stats, 3, "CLIC → MODO", "—")
         left.pack_start(stats, False, False, 0)
 
         left.pack_start(self._section_label("CALIBRACIÓN — GRADOS POR CLIC"), False, False, 0)
@@ -479,8 +477,12 @@ class App(Gtk.Application):
         btn.connect("clicked", handler)
         return btn
 
-    def _click_handler(self, key):
-        return lambda _btn: self.set_click_key(key)
+    def _mode_combo(self):
+        combo = Gtk.ComboBoxText()
+        for m in ("scroll", "volume", "text", "brightness", "zoom"):
+            combo.append(m, MODE_LABELS.get(m, m))
+        combo.set_active_id("scroll")
+        return combo
 
     def _stat(self, grid, col, label, value):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -513,12 +515,10 @@ class App(Gtk.Application):
         try:
             data = json.loads(urllib.request.urlopen(API + "/api/status", timeout=2).read())
             self.apply_mode(data.get("mode", "scroll"))
-            keys = data.get("click_keys") or self.click_keys
-            if keys != self.click_keys:
-                self.click_keys = keys
-            self.apply_click_key(data.get("click_key", "mute"))
             self.apply_scroll_step(data.get("scroll_step", 1))
             self.apply_scroll_invert(data.get("scroll_invert", False))
+            self.apply_presets(data.get("presets"))
+            self.apply_click_modes(data.get("click_modes"))
             self.render_shortcuts(data.get("shortcuts") or [], data.get("active_shortcut"))
             self.status_label.set_text(data.get("device", "dispositivo") + " activo")
             self.status_dot.get_style_context().remove_class("dot-warn")
@@ -537,14 +537,6 @@ class App(Gtk.Application):
         except Exception as exc:
             self.status_label.set_text("No se pudo cambiar modo: " + str(exc))
 
-    def set_click_key(self, key):
-        req = urllib.request.Request(API + "/api/click-map", data=json.dumps({"click_key": key}).encode(), headers={"content-type": "application/json"}, method="POST")
-        try:
-            data = json.loads(urllib.request.urlopen(req, timeout=2).read())
-            self.apply_click_key(data.get("click_key", key))
-        except Exception as exc:
-            self.status_label.set_text("No se pudo cambiar el clic: " + str(exc))
-
     def adjust_scroll_step(self, step):
         new_step = max(1, min(10, self.scroll_step + step))
         req = urllib.request.Request(API + "/api/scroll-step", data=json.dumps({"scroll_step": new_step}).encode(), headers={"content-type": "application/json"}, method="POST")
@@ -561,13 +553,6 @@ class App(Gtk.Application):
             btn.get_style_context().remove_class("active")
             if mode == name:
                 btn.get_style_context().add_class("active")
-
-    def apply_click_key(self, key):
-        self.click_key = key
-        for k, btn in self.click_buttons.items():
-            btn.get_style_context().remove_class("active")
-        if key in self.click_buttons:
-            self.click_buttons[key].get_style_context().add_class("active")
 
     def apply_scroll_step(self, step):
         self.scroll_step = int(step)
@@ -598,25 +583,24 @@ class App(Gtk.Application):
             lab.get_style_context().add_class("copy")
             self.shortcut_box.pack_start(lab, False, False, 0)
             return
-        key_labels = {"alt": "Alt", "ctrl": "Ctrl", "shift": "Shift", "tab": "Tab", "left": "←", "right": "→"}
         for sc in self.shortcuts:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.get_style_context().add_class("shortcut-row")
             if active_id and sc.get("id") == active_id:
                 row.get_style_context().add_class("active")
-            mod_label = " + ".join(key_labels.get(m, m) for m in sc.get("mods", []))
+            mod_label = " + ".join(KEY_LABELS.get(m, m) for m in sc.get("mods", []))
             sc_id = sc.get("id", "")
             cb = Gtk.CheckButton.new_with_label(mod_label + " + rueda")
             cb.set_active(sc.get("enabled", True))
             cb.connect("toggled", lambda _b, sid=sc_id: self.toggle_shortcut(sid, _b.get_active()))
             row.pack_start(cb, False, False, 0)
-            up_label = Gtk.Label(label=" → " + ",".join(key_labels.get(k, k) for k in sc.get("up", [])), xalign=0)
-            up_label.get_style_context().add_class("shortcut-name")
-            row.pack_start(up_label, False, False, 0)
             if sc.get("type") == "command":
-                cmd_label = Gtk.Label(label=" ⚙ " + sc.get("command", ""), xalign=0)
-                cmd_label.get_style_context().add_class("shortcut-name")
-                row.pack_start(cmd_label, False, False, 0)
+                result_text = " ⚙ " + sc.get("command", "")
+            else:
+                result_text = " → " + (self._preset_name_for(sc) or ",".join(KEY_LABELS.get(k, k) for k in sc.get("up", [])))
+            result_label = Gtk.Label(label=result_text, xalign=0)
+            result_label.get_style_context().add_class("shortcut-name")
+            row.pack_start(result_label, False, False, 0)
             if active_id and sc.get("id") == active_id:
                 tag = Gtk.Label(label="ACTIVO")
                 tag.get_style_context().add_class("shortcut-active-tag")
@@ -624,6 +608,139 @@ class App(Gtk.Application):
             self.shortcut_box.pack_start(row, False, False, 0)
             self.shortcut_rows[sc_id] = row
         self.shortcut_box.show_all()
+
+    def _preset_name_for(self, sc):
+        for preset in self.presets.values():
+            if preset.get("up") == sc.get("up") and preset.get("down") == sc.get("down"):
+                return preset.get("name")
+        return None
+
+    def apply_presets(self, presets):
+        self.presets = presets or {}
+
+    def apply_click_modes(self, click_modes):
+        # Al aplicar el estado que manda el backend, los combos disparan su
+        # propio "changed" — el flag evita reenviar ese mismo valor de vuelta.
+        if not click_modes or len(click_modes) != 2:
+            return
+        self.click_modes = list(click_modes)
+        self._applying_click_modes = True
+        self.click_mode_combo_a.set_active_id(click_modes[0])
+        self.click_mode_combo_b.set_active_id(click_modes[1])
+        self._applying_click_modes = False
+
+    def on_click_mode_changed(self, changed_combo, other_combo):
+        if getattr(self, "_applying_click_modes", False):
+            return
+        a = self.click_mode_combo_a.get_active_id()
+        b = self.click_mode_combo_b.get_active_id()
+        if a == b:
+            for row in other_combo.get_model():
+                candidate = row[0]
+                if candidate != a:
+                    self._applying_click_modes = True
+                    other_combo.set_active_id(candidate)
+                    self._applying_click_modes = False
+                    break
+            a = self.click_mode_combo_a.get_active_id()
+            b = self.click_mode_combo_b.get_active_id()
+        req = urllib.request.Request(
+            API + "/api/click-modes",
+            data=json.dumps({"click_modes": [a, b]}).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as exc:
+            self.status_label.set_text("No se pudo cambiar el clic: " + str(exc))
+
+    def start_capture(self):
+        req = urllib.request.Request(API + "/api/capture", data=json.dumps({"capture": True}).encode(), headers={"content-type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            self.status_label.set_text("Capturando... mantén Alt/Ctrl/Shift y gira el knob")
+        except Exception as exc:
+            self.status_label.set_text("No se pudo iniciar la captura: " + str(exc))
+
+    def on_captured(self, mods):
+        if not mods:
+            self.status_label.set_text("No se detectó modificador — mantén Alt/Ctrl/Shift mientras giras")
+            return
+        self.open_shortcut_dialog(mods)
+
+    def open_shortcut_dialog(self, mods):
+        dialog = Gtk.Dialog(title="Nuevo shortcut", transient_for=self.window, modal=True)
+        dialog.add_buttons("Cancelar", Gtk.ResponseType.CANCEL, "Guardar", Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+
+        mod_label = Gtk.Label(label="Combinación: " + " + ".join(KEY_LABELS.get(m, m) for m in mods) + " + rueda", xalign=0)
+        box.pack_start(mod_label, False, False, 0)
+
+        name_entry = Gtk.Entry()
+        name_entry.set_placeholder_text("Nombre (ej: Abrir terminal)")
+        box.pack_start(name_entry, False, False, 0)
+
+        type_combo = Gtk.ComboBoxText()
+        type_combo.append("preset", "Acción predeterminada")
+        type_combo.append("command", "Ejecutar comando")
+        type_combo.set_active_id("preset")
+        box.pack_start(type_combo, False, False, 0)
+
+        preset_combo = Gtk.ComboBoxText()
+        for pid, preset in self.presets.items():
+            preset_combo.append(pid, preset.get("name", pid))
+        if self.presets:
+            preset_combo.set_active(0)
+        box.pack_start(preset_combo, False, False, 0)
+
+        cmd_entry = Gtk.Entry()
+        cmd_entry.set_placeholder_text("Comando (ej: xdg-open https://github.com)")
+        cmd_entry.set_visible(False)
+        box.pack_start(cmd_entry, False, False, 0)
+
+        def on_type_changed(_c):
+            is_command = type_combo.get_active_id() == "command"
+            cmd_entry.set_visible(is_command)
+            preset_combo.set_visible(not is_command)
+
+        type_combo.connect("changed", on_type_changed)
+        on_type_changed(type_combo)
+
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            name = name_entry.get_text().strip() or "Shortcut"
+            if type_combo.get_active_id() == "command":
+                command = cmd_entry.get_text().strip()
+                if command:
+                    self.save_shortcut({"name": name, "mods": mods, "type": "command", "command": command})
+                else:
+                    self.status_label.set_text("Escribe un comando antes de guardar")
+            else:
+                preset_id = preset_combo.get_active_id()
+                preset = self.presets.get(preset_id)
+                if preset:
+                    self.save_shortcut({"name": name, "mods": mods, "type": "key", "up": preset["up"], "down": preset["down"]})
+                else:
+                    self.status_label.set_text("Elige una acción predeterminada")
+        dialog.destroy()
+
+    def save_shortcut(self, shortcut):
+        req = urllib.request.Request(
+            API + "/api/shortcut-add",
+            data=json.dumps({"shortcut": shortcut}).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            data = json.loads(urllib.request.urlopen(req, timeout=2).read())
+            self.render_shortcuts(data.get("shortcuts"), self.active_shortcut_id)
+            self.status_label.set_text("Shortcut guardado")
+        except Exception as exc:
+            self.status_label.set_text("No se pudo guardar el shortcut: " + str(exc))
 
     def toggle_shortcut(self, sc_id, enabled):
         req = urllib.request.Request(
@@ -653,9 +770,9 @@ class App(Gtk.Application):
         self.dir_value.set_text("derecha / arriba" if delta > 0 else "izquierda / abajo")
         self.knob.turn(delta)
 
-    def apply_click_event(self, key):
-        self.last_click_label = CLICK_LABELS.get(key, key)
-        self.click_value.set_text(self.last_click_label)
+    def apply_click_event(self, mode):
+        self.last_click_label = mode
+        self.click_value.set_text(mode)
         self.knob.click()
 
     def adjust_calibration(self, step):
@@ -694,14 +811,16 @@ class App(Gtk.Application):
                             GLib.idle_add(self.highlight_shortcut, data.get("shortcut"))
                     elif kind == "shortcuts":
                         GLib.idle_add(self.render_shortcuts, data.get("shortcuts") or [], self.active_shortcut_id)
-                    elif kind == "click_key":
-                        GLib.idle_add(self.apply_click_key, data.get("click_key", "mute"))
                     elif kind == "scroll_step":
                         GLib.idle_add(self.apply_scroll_step, data.get("scroll_step", 1))
                     elif kind == "scroll_invert":
                         GLib.idle_add(self.apply_scroll_invert, data.get("scroll_invert", False))
                     elif kind == "click":
-                        GLib.idle_add(self.apply_click_event, data.get("click_key", "mute"))
+                        GLib.idle_add(self.apply_click_event, data.get("mode", "scroll"))
+                    elif kind == "click_modes":
+                        GLib.idle_add(self.apply_click_modes, data.get("click_modes"))
+                    elif kind == "captured" and data.get("key") == "turn":
+                        GLib.idle_add(self.on_captured, data.get("mods") or [])
                 GLib.idle_add(self.status_label.set_text, "Reconectando al servicio...")
             except Exception:
                 GLib.idle_add(self.status_label.set_text, "Reconectando al servicio...")

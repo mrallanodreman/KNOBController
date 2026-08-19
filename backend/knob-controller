@@ -56,7 +56,7 @@ KEY_KNOB_CLICK = 113
 
 MODES = {"scroll", "volume", "text", "brightness", "zoom"}
 DEFAULT_MODE = "scroll"
-CLICK_TOGGLE_MODES = ("scroll", "text")
+DEFAULT_CLICK_MODES = ["scroll", "text"]
 
 # Modificadores espiados desde el teclado normal SIN grabarlo.
 MODIFIER_KEYS = {KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
@@ -64,6 +64,13 @@ MOD_ALT = {KEY_LEFTALT, KEY_RIGHTALT}
 MOD_CTRL = {KEY_LEFTCTRL, KEY_RIGHTCTRL}
 MOD_SHIFT = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
 MOD_MAP = {"alt": MOD_ALT, "ctrl": MOD_CTRL, "shift": MOD_SHIFT}
+# Inverso de MOD_MAP para traducir un modificador sostenido (código evdev) al
+# nombre lógico usado en shortcuts — así la captura sabe qué mantuviste.
+CODE_TO_MOD = {
+    KEY_LEFTALT: "alt", KEY_RIGHTALT: "alt",
+    KEY_LEFTCTRL: "ctrl", KEY_RIGHTCTRL: "ctrl",
+    KEY_LEFTSHIFT: "shift", KEY_RIGHTSHIFT: "shift",
+}
 
 SHORTCUT_KEYCODES = {
     "tab": KEY_TAB, "left": KEY_LEFT, "right": KEY_RIGHT,
@@ -76,6 +83,16 @@ SHORTCUT_KEYCODES = {
 # Acciones de tipo "command" se ejecutan con el shell; así puedes mapear el
 # knob a CUALQUIER cosa (abrir una app, script, etc).
 KEY_EMIT_KEYS = set(SHORTCUT_KEYCODES.values()) | {KEY_VOLUMEUP, KEY_VOLUMEDOWN}
+
+# Acciones predeterminadas que la UI ofrece como alternativa a "comando": el
+# usuario captura el modificador y elige una de estas en vez de teclear
+# keycodes sueltos.
+PRESET_ACTIONS = {
+    "switch-app": {"name": "Cambiar de aplicación", "up": ["tab"], "down": ["tab"]},
+    "terminal-panes": {"name": "Paneles de terminal", "up": ["right"], "down": ["left"]},
+    "confirm-cancel": {"name": "Confirmar / Cancelar", "up": ["enter"], "down": ["esc"]},
+    "space": {"name": "Espacio (reproducir / pausar)", "up": ["space"], "down": ["space"]},
+}
 
 DEFAULT_SHORTCUTS = [
     {
@@ -131,6 +148,7 @@ class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.mode = DEFAULT_MODE
+        self.click_modes = list(DEFAULT_CLICK_MODES)
         self.scroll_step = 1
         self.scroll_invert = False
         self.device = "not found"
@@ -145,17 +163,27 @@ class State:
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 self.mode = data.get("mode", DEFAULT_MODE) if data.get("mode") in MODES else DEFAULT_MODE
+                self.click_modes = self._validate_click_modes(data.get("click_modes"))
                 step = data.get("scroll_step", 1)
                 self.scroll_step = step if isinstance(step, int) and 1 <= step <= 10 else 1
                 self.scroll_invert = bool(data.get("scroll_invert", False))
                 self.shortcuts = self._validate_shortcuts(data.get("shortcuts"))
             except Exception:
                 self.mode = DEFAULT_MODE
+                self.click_modes = list(DEFAULT_CLICK_MODES)
                 self.scroll_step = 1
                 self.scroll_invert = False
                 self.shortcuts = DEFAULT_SHORTCUTS
         else:
             self.save()
+
+    @staticmethod
+    def _validate_click_modes(click_modes):
+        if isinstance(click_modes, list) and len(click_modes) == 2:
+            a, b = click_modes
+            if a in MODES and b in MODES and a != b:
+                return [a, b]
+        return list(DEFAULT_CLICK_MODES)
 
     @staticmethod
     def _validate_shortcuts(shortcuts):
@@ -204,6 +232,7 @@ class State:
             json.dumps(
                 {
                     "mode": self.mode,
+                    "click_modes": self.click_modes,
                     "scroll_step": self.scroll_step,
                     "scroll_invert": self.scroll_invert,
                     "shortcuts": self.shortcuts,
@@ -280,11 +309,24 @@ class State:
     def toggle_click_mode(self):
         with self.lock:
             current = self.mode
-            new_mode = CLICK_TOGGLE_MODES[0] if current == CLICK_TOGGLE_MODES[1] else CLICK_TOGGLE_MODES[1]
+            a, b = self.click_modes
+            new_mode = a if current == b else b
             self.mode = new_mode
             self.save()
         self.publish({"type": "mode", "mode": new_mode})
         return new_mode
+
+    def set_click_modes(self, click_modes):
+        if not isinstance(click_modes, list) or len(click_modes) != 2:
+            raise ValueError("click_modes debe tener exactamente 2 modos")
+        a, b = click_modes
+        if a not in MODES or b not in MODES or a == b:
+            raise ValueError("click_modes inválido")
+        with self.lock:
+            self.click_modes = [a, b]
+            self.save()
+        self.publish({"type": "click_modes", "click_modes": self.click_modes})
+        return self.click_modes
 
     def set_scroll_step(self, scroll_step):
         if not isinstance(scroll_step, int) or not (1 <= scroll_step <= 10):
@@ -453,10 +495,13 @@ def knob_loop():
                             continue
 
                         # MODO CAPTURA: en lugar de ejecutar, registramos el
-                        # gesto para que la UI lo guarde como shortcut nuevo.
+                        # modificador sostenido para que la UI complete el
+                        # shortcut (comando o acción predeterminada).
                         if state.capture_mode:
+                            with state.lock:
+                                mods = sorted({CODE_TO_MOD[c] for c in state.held_mods if c in CODE_TO_MOD})
                             state.set_capture(False)
-                            state.publish({"type": "captured", "key": "turn", "direction": "up" if delta > 0 else "down"})
+                            state.publish({"type": "captured", "key": "turn", "direction": "up" if delta > 0 else "down", "mods": mods})
                             continue
 
                         with state.lock:
@@ -532,6 +577,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             self.send_json({
                 "mode": state.mode,
+                "click_modes": state.click_modes,
                 "device": state.device,
                 "scroll_step": state.scroll_step,
                 "scroll_invert": state.scroll_invert,
@@ -539,6 +585,7 @@ class Handler(BaseHTTPRequestHandler):
                 "active_shortcut": state.active_shortcut()["id"] if state.active_shortcut() else None,
                 "capture": state.capture_mode,
                 "modes": list(MODES),
+                "presets": PRESET_ACTIONS,
             })
         elif self.path == "/events":
             client = queue.Queue(maxsize=128)
@@ -574,6 +621,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 state.set_mode(data.get("mode"))
                 self.send_json({"mode": state.mode})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+        elif self.path == "/api/click-modes":
+            try:
+                new = state.set_click_modes(data.get("click_modes"))
+                self.send_json({"click_modes": new})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 400)
         elif self.path == "/api/scroll-step":
@@ -648,7 +701,7 @@ button.active{background:linear-gradient(135deg,#38bdf8,#8b5cf6);color:#fff;bord
 .keys{margin-left:auto;display:flex;gap:5px}
 .tag{color:#4ade80;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
 .del{background:rgba(248,113,113,.15);border-color:rgba(248,113,113,.3);color:#fca5a5;padding:3px 8px;font-size:11px}
-input[type=text]{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:#eef3ff;padding:8px 10px;border-radius:10px;font-size:13px;width:100%;box-sizing:border-box}
+input[type=text],select{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:#eef3ff;padding:8px 10px;border-radius:10px;font-size:13px;width:100%;box-sizing:border-box}
 label{display:block;font-size:10px;color:#8996bd;letter-spacing:.1em;text-transform:uppercase;margin:8px 0 4px}
 .capture{border:1px dashed #8b5cf6;background:rgba(139,92,246,.08)}
 .capture.hot{border-color:#fbbf24;animation:pulse 1s infinite}
@@ -673,24 +726,41 @@ label{display:block;font-size:10px;color:#8996bd;letter-spacing:.1em;text-transf
         <div class="mode" id="modes"></div>
       </div>
       <div class="card" style="margin-top:18px">
+        <h2>Clic del knob — alterna entre</h2>
+        <div style="display:flex;align-items:center;gap:10px">
+          <select id="click-mode-a" onchange="onClickModeChange('a')"></select>
+          <span style="color:#8996bd">↔</span>
+          <select id="click-mode-b" onchange="onClickModeChange('b')"></select>
+        </div>
+      </div>
+      <div class="card" style="margin-top:18px">
         <h2>Shortcuts — modificador + rueda</h2>
         <div id="shortcuts"></div>
         <div style="margin-top:10px">
           <label>Nombre del nuevo shortcut</label>
           <input type="text" id="new-name" placeholder="ej: Abrir terminal"/>
         </div>
-        <div style="margin-top:6px;display:flex;gap:8px">
-          <button onclick="startCapture('key')">Capturar teclas</button>
-          <button onclick="startCapture('command')">Ejecutar comando</button>
-        </div>
-        <div id="cmdbox" style="display:none;margin-top:8px">
-          <label>Comando a ejecutar al girar</label>
-          <input type="text" id="new-cmd" placeholder="ej: xdg-open https://github.com"/>
-          <button onclick="addCommandShortcut()" style="margin-top:8px;width:100%">Guardar shortcut de comando</button>
+        <div style="margin-top:6px">
+          <button onclick="startCapture()">Capturar combinación</button>
         </div>
         <p id="capturehint" class="capture" style="display:none;padding:12px;border-radius:12px">
-          <b>Capturando.</b> Mantén el modificador (Alt/Ctrl/Shift) y gira el knob. Se grabará como shortcut nuevo.
+          <b>Capturando.</b> Mantén el modificador (Alt/Ctrl/Shift) y gira el knob.
         </p>
+        <div id="resultbox" style="display:none;margin-top:10px">
+          <p id="captured-mods-label" style="margin:0 0 6px;color:#4ade80;font-weight:700"></p>
+          <label>Resultado</label>
+          <select id="result-type" onchange="onResultTypeChange()">
+            <option value="preset">Acción predeterminada</option>
+            <option value="command">Ejecutar comando</option>
+          </select>
+          <div id="preset-box" style="margin-top:8px">
+            <select id="preset-select"></select>
+          </div>
+          <div id="cmdbox" style="display:none;margin-top:8px">
+            <input type="text" id="new-cmd" placeholder="ej: xdg-open https://github.com"/>
+          </div>
+          <button onclick="saveCapturedShortcut()" style="margin-top:8px;width:100%">Guardar shortcut</button>
+        </div>
       </div>
     </div>
 
@@ -711,14 +781,37 @@ label{display:block;font-size:10px;color:#8996bd;letter-spacing:.1em;text-transf
 </div>
 <script>
 const KEY_LABELS={alt:'Alt',ctrl:'Ctrl',shift:'Shift',tab:'Tab',left:'←',right:'→',enter:'Enter',esc:'Esc',space:'Espacio',leftalt:'Alt',rightalt:'Alt',leftctrl:'Ctrl',rightctrl:'Ctrl',leftshift:'Shift',rightshift:'Shift'};
-let capture=null;
+const MODE_LABELS={scroll:'Scroll',volume:'Volumen',text:'Cursor',brightness:'Brillo',zoom:'Zoom'};
+let presets={};
+let capturedMods=null;
 let activeSc=null;
 function el(id){return document.getElementById(id);}
 function renderModes(modes){
   const modesArr = modes||['scroll','volume','text'];
-  el('modes').innerHTML = modesArr.map(m=>`<button id="m-${m}" onclick="setMode('${m}')">${m}</button>`).join('');
+  el('modes').innerHTML = modesArr.map(m=>`<button id="m-${m}" onclick="setMode('${m}')">${MODE_LABELS[m]||m}</button>`).join('');
 }
 function applyMode(mode){ el('mode').textContent=mode; document.querySelectorAll('#modes button').forEach(b=>b.classList.toggle('active', b.id==='m-'+mode)); }
+function renderClickModes(allModes, clickModes){
+  for(const [sel,val] of [['click-mode-a',clickModes[0]],['click-mode-b',clickModes[1]]]){
+    el(sel).innerHTML = allModes.map(m=>`<option value="${m}" ${m===val?'selected':''}>${MODE_LABELS[m]||m}</option>`).join('');
+  }
+}
+async function onClickModeChange(changed){
+  let a=el('click-mode-a').value, b=el('click-mode-b').value;
+  if(a===b){
+    const alt=el(changed==='a'?'click-mode-b':'click-mode-a');
+    for(const opt of alt.options){ if(opt.value!==a){ alt.value=opt.value; break; } }
+    a=el('click-mode-a').value; b=el('click-mode-b').value;
+  }
+  await fetch('/api/click-modes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({click_modes:[a,b]})});
+}
+function presetNameFor(sc){
+  if(sc.type!=='key') return null;
+  for(const p of Object.values(presets)){
+    if(JSON.stringify(p.up)===JSON.stringify(sc.up) && JSON.stringify(p.down)===JSON.stringify(sc.down)) return p.name;
+  }
+  return null;
+}
 function renderShortcuts(scs, activeId){
   activeSc=activeId||null;
   const box=el('shortcuts');
@@ -726,7 +819,7 @@ function renderShortcuts(scs, activeId){
   box.innerHTML=scs.map(sc=>{
     const mod=(sc.mods||[]).map(m=>`<span class="kbd">${KEY_LABELS[m]||m}</span>`).join(' + ');
     const on=sc.enabled!==false;
-    const keys = sc.type==='command' ? `<span class="kbd">⚙ ${sc.command||''}</span>` : (sc.up||[]).map(k=>`<span class="kbd">${KEY_LABELS[k]||k}</span>`).join('');
+    const keys = sc.type==='command' ? `<span class="kbd">⚙ ${sc.command||''}</span>` : `<span class="kbd">${presetNameFor(sc) || (sc.up||[]).map(k=>KEY_LABELS[k]||k).join('+')}</span>`;
     const act = activeId===sc.id ? '<span class="tag">activo</span>' : '';
     return `<div class="row ${activeId===sc.id?'active':''}">
       <input type="checkbox" ${on?'checked':''} onchange="toggleSc('${sc.id}',this.checked)"/>
@@ -741,23 +834,42 @@ async function toggleSc(id,on){await fetch('/api/shortcut-enabled',{method:'POST
 async function deleteSc(id){await fetch('/api/shortcut-delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})});refresh();}
 async function refresh(){
   const d=await (await fetch('/api/status')).json();
+  presets=d.presets||{};
   renderModes(d.modes); applyMode(d.mode);
+  renderClickModes(d.modes||[], d.click_modes||['scroll','text']);
+  el('preset-select').innerHTML=Object.entries(presets).map(([id,p])=>`<option value="${id}">${p.name}</option>`).join('');
   renderShortcuts(d.shortcuts,d.active_shortcut);
   el('status').textContent=(d.device||'')+' activo';
 }
-async function startCapture(type){
-  capture={type,mods:null,dir:null};
+function onResultTypeChange(){
+  const t=el('result-type').value;
+  el('preset-box').style.display = t==='preset' ? 'block' : 'none';
+  el('cmdbox').style.display = t==='command' ? 'block' : 'none';
+}
+async function startCapture(){
+  capturedMods=null;
+  el('resultbox').style.display='none';
   el('capturehint').style.display='block';
-  el('cmdbox').style.display = type==='command' ? 'block' : 'none';
   await fetch('/api/capture',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({capture:true})});
 }
-async function addCommandShortcut(){
-  const name=el('new-name').value.trim()||'Comando';
-  const command=el('new-cmd').value.trim();
-  if(!command){alert('Escribe un comando');return;}
-  await fetch('/api/shortcut-add',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({shortcut:{name,mods:['alt'],type:'command',command}}) });
-  el('cmdbox').style.display='none'; el('capturehint').style.display='none';
-  await fetch('/api/capture',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({capture:false})});
+async function saveCapturedShortcut(){
+  if(!capturedMods||!capturedMods.length){alert('Captura una combinación primero');return;}
+  const name=el('new-name').value.trim()||'Shortcut';
+  const type=el('result-type').value;
+  let shortcut;
+  if(type==='command'){
+    const command=el('new-cmd').value.trim();
+    if(!command){alert('Escribe un comando');return;}
+    shortcut={name,mods:capturedMods,type:'command',command};
+  } else {
+    const presetId=el('preset-select').value;
+    const p=presets[presetId];
+    if(!p){alert('Elige una acción');return;}
+    shortcut={name,mods:capturedMods,type:'key',up:p.up,down:p.down};
+  }
+  await fetch('/api/shortcut-add',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({shortcut})});
+  el('resultbox').style.display='none';
+  capturedMods=null;
   refresh();
 }
 function move(delta){const t=el('ticks');t.textContent=parseInt(t.textContent||'0')+delta;el('dir').textContent=delta>0?'derecha':'izquierda';}
@@ -766,13 +878,18 @@ const ev=new EventSource('/events');
 ev.onmessage=(m)=>{
   const d=JSON.parse(m.data);
   if(d.type==='mode')applyMode(d.mode);
+  if(d.type==='click_modes')renderClickModes(Array.from(document.querySelectorAll('#click-mode-a option')).map(o=>o.value), d.click_modes);
   if(d.type==='turn'){move(d.delta);if(d.shortcut)refresh();}
-  if(d.type==='captured'){
+  if(d.type==='captured' && d.key==='turn'){
     el('capturehint').style.display='none';
-    if(capture&&capture.type==='key'&&d.key==='turn'){
-      // giró sin modificador — no sirve; pedimos que mantenga un modificador
+    if(!d.mods || !d.mods.length){
+      alert('Mantén Alt, Ctrl o Shift mientras giras el knob para capturar la combinación.');
+      return;
     }
-    refresh();
+    capturedMods=d.mods;
+    el('captured-mods-label').textContent='Combinación capturada: '+d.mods.map(m=>KEY_LABELS[m]||m).join(' + ');
+    onResultTypeChange();
+    el('resultbox').style.display='block';
   }
 };
 ev.onerror=()=>{el('status').textContent='Reconectando...'};
